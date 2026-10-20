@@ -540,7 +540,7 @@ void arenaEvent(WStype_t type, uint8_t *payload, size_t length) {
     } else {
       wsFragmentActive = true;
       // Avoid repeated exponential String reallocations as each 2 KB frame arrives.
-      if (wsFragmentBuffer.capacity() < 16U * 1024U && ESP.getFreeHeap() > 55000U)
+      if (ESP.getFreeHeap() > 55000U)
         wsFragmentBuffer.reserve(16U * 1024U);
       appendWsFragment(payload, length);
     }
