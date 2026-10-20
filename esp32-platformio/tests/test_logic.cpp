@@ -1,6 +1,7 @@
 #include "../include/FieldLightLogic.h"
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 using namespace field_light;
 int main() {
@@ -52,5 +53,22 @@ int main() {
   uint32_t nearWrap = 0xFFFFFF00U;
   uint32_t afterWrap = 800U;
   assert(uint32_t(afterWrap - nearWrap) == 1056U);
+  // Stock Freezy Arena websocket envelope. Skip scores and other large
+  // display data before buffering or deserializing (prevents slow listeners).
+  auto identify = [](const char *data) {
+    return classifyWsMessage(reinterpret_cast<const uint8_t *>(data),
+                             std::strlen(data));
+  };
+  assert(identify("{\"type\":\"arenaStatus\",\"data\":{") == WsMessageKind::ArenaStatus);
+  assert(identify("{\"type\":\"matchTime\",\"data\":{") == WsMessageKind::MatchTime);
+  assert(identify("{\"type\":\"ping\",\"data\":null}") == WsMessageKind::Ping);
+  assert(identify("{\"type\":\"matchTiming\",\"data\":{") == WsMessageKind::OtherHeartbeat);
+  assert(identify("{\"type\":\"matchLoad\",\"data\":{") == WsMessageKind::OtherHeartbeat);
+  assert(identify("{\"type\":\"realtimeScore\",\"data\":{") == WsMessageKind::Ignore);
+  assert(identify("{\"type\":\"displayConfiguration\",\"data\":{") == WsMessageKind::Ignore);
+  assert(identify("{\"data\":{},\"type\":\"arenaStatus\"}") == WsMessageKind::ArenaStatus);
+  assert(identify("{\"type\":\"bogus\"}") == WsMessageKind::Ignore);
+  assert(identify("{\"type\":\"arenaSta") == WsMessageKind::Ignore);
+  assert(identify("") == WsMessageKind::Ignore);
   std::cout << "Freezy Arena ESP32 PLC phase-to-signal mapping: PASS\n";
 }

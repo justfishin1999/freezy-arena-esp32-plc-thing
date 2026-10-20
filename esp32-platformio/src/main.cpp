@@ -19,14 +19,14 @@
 #include "WebUI.h"
 
 namespace {
-constexpr const char *kVersion = "2026.10.19.plc1.5";
+constexpr const char *kVersion = "2026.10.20.plc1.6";
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kArenaPortDefault = 8080;
 constexpr uint32_t kServerSilenceMs = 30000;
 constexpr uint32_t kArenaStatusStaleMs = 4000;
-// Gorilla WebSocket fragments large messages at its ~2 KB write buffer.
-// Keep a bounded assembly buffer for the Field Monitor arenaStatus stream.
-constexpr size_t kMaxWsMessageBytes = 48U * 1024U;
+// Gorilla WebSocket fragments large status messages. A 64 KiB cap protects heap;
+// unrelated display messages are discarded before assembly or JSON parsing.
+constexpr size_t kMaxWsMessageBytes = 64U * 1024U;
 constexpr uint32_t kNoStatusWarningMs = 8000;
 constexpr uint32_t kWifiAttemptMs = 12000;
 constexpr uint32_t kTestDurationMs = 15000;
@@ -37,6 +37,7 @@ constexpr uint32_t kApAfterWifiLostMs = 15000;
 constexpr uint8_t kButtonPin = 33;  // Optional NO button to GND, hold 10 s to reset credentials.
 constexpr size_t kLogCount = 48;
 constexpr char kMatchWsPath[] = "/api/arena/websocket";
+constexpr char kFieldWsPath[] = "/displays/field_monitor/websocket";
 constexpr const char *kStations[] = {"R1", "R2", "R3", "B1", "B2", "B3"};
 
 struct Settings {
@@ -62,7 +63,11 @@ String wsPath;
 String wsFragmentBuffer;
 bool wsFragmentActive = false;
 bool wsFragmentOverflow = false;
+bool wsFragmentIgnored = false;
 bool wsProcessingFragmented = false;
+uint32_t wsIgnoredMessages = 0;
+uint32_t wsStatusParseErrors = 0;
+uint32_t wsPeakStatusParseMs = 0;
 uint32_t wsFragmentedCount = 0;
 uint32_t wsFragmentErrorCount = 0;
 uint32_t wsStatusReceivedCount = 0;
@@ -351,24 +356,36 @@ void updateOutputs() {
 // across several WebSocket frames, especially arenaStatus, because Freezy Arena
 // uses a small Gorilla WebSocket write buffer. Do not process partial JSON.
 void processArenaText(const uint8_t *payload, size_t length) {
-  // Field Monitor sends potentially large messages. Parse only the status fields
-  // used by this auxiliary indicator; do not copy team records or scores.
-  JsonDocument filter;
-  filter["type"] = true;
-  filter["data"]["MatchState"] = true;
-  filter["data"]["CanStartMatch"] = true;
-  filter["data"]["RobotsAssigned"] = true;
-  filter["data"]["RobotsSatisfied"] = true;
-  filter["data"]["RobotsReady"] = true;
-  for (const char *station : kStations) {
-    filter["data"]["AllianceStations"][station]["Team"]["Id"] = true;
-    filter["data"]["AllianceStations"][station]["Bypass"] = true;
-    filter["data"]["AllianceStations"][station]["DsConn"]["RobotLinked"] = true;
-    filter["data"]["AllianceStations"][station]["EStop"] = true;
+  // Freezy Arena's field monitor carries frequent realtimeScore and other
+  // unrelated display updates. They are skipped before calling this function.
+  // Build ArduinoJson's field selector once, not for every 500 ms status tick.
+  static JsonDocument filter;
+  static bool filterInitialized = false;
+  if (!filterInitialized) {
+    filter["type"] = true;
+    filter["data"]["MatchState"] = true;
+    filter["data"]["CanStartMatch"] = true;
+    for (const char *station : kStations) {
+      filter["data"]["AllianceStations"][station]["Team"]["Id"] = true;
+      filter["data"]["AllianceStations"][station]["Bypass"] = true;
+      filter["data"]["AllianceStations"][station]["DsConn"]["RobotLinked"] = true;
+      filter["data"]["AllianceStations"][station]["EStop"] = true;
+    }
+    filterInitialized = true;
   }
+  const uint32_t parseStartedMs = millis();
   JsonDocument message;
-  auto error = deserializeJson(message, payload, length, DeserializationOption::Filter(filter));
-  if (error) { addLog(String("Malformed Arena message: ") + error.c_str()); return; }
+  const auto error = deserializeJson(message, payload, length, DeserializationOption::Filter(filter));
+  const uint32_t parseMs = millis() - parseStartedMs;
+  if (parseMs > wsPeakStatusParseMs) wsPeakStatusParseMs = parseMs;
+  if (error) {
+    ++wsStatusParseErrors;
+    // Do not fill the log with repeated parse errors while Wi-Fi is saturated.
+    if (wsStatusParseErrors <= 3 || (wsStatusParseErrors % 50U) == 0)
+      addLog(String("Malformed Arena message: ") + error.c_str() +
+             " (" + String(length) + " bytes)");
+    return;
+  }
   const char *kind = message["type"].as<const char *>();
   if (!kind) return;
   if (strcmp(kind, "matchTime") == 0) {
@@ -391,39 +408,6 @@ void processArenaText(const uint8_t *payload, size_t length) {
     fieldState = incoming;
     haveState = true;
     lastFrameMs = millis();
-  } else if (strcmp(kind, "fieldLightStatus") == 0) {
-    // Compact read-only FMS status: no field-monitor UI or heavy arenaStatus stream.
-    // Requires companion FMS patch; available on /api/arena/websocket.
-    const JsonVariantConst status = message["data"];
-    if (!status["CanStartMatch"].is<bool>() ||
-        !status["RobotsAssigned"].is<int>() ||
-        !status["RobotsSatisfied"].is<int>() ||
-        !status["RobotsReady"].is<bool>()) {
-      clearArenaStatus();
-      addLog("Invalid compact FMS readiness payload");
-      return;
-    }
-    const int assigned = status["RobotsAssigned"].as<int>();
-    const int satisfied = status["RobotsSatisfied"].as<int>();
-    if (assigned < 0 || assigned > 6 || satisfied < 0 || satisfied > assigned) {
-      clearArenaStatus();
-      addLog("Invalid compact FMS station counts");
-      return;
-    }
-    const bool wasReady = robotsReady;
-    const bool wasStartable = canStartMatch;
-    robotsAssigned = static_cast<uint8_t>(assigned);
-    robotsSatisfied = static_cast<uint8_t>(satisfied);
-    robotsReady = status["RobotsReady"].as<bool>() && assigned > 0 && assigned == satisfied;
-    canStartMatch = status["CanStartMatch"].as<bool>();
-    haveArenaStatus = true;
-    lastArenaStatusMs = millis();
-    lastFrameMs = millis();
-    if (++wsStatusReceivedCount == 1) addLog("First compact fieldLightStatus received");
-    if (wasReady != robotsReady || wasStartable != canStartMatch) {
-      addLog(String("Arena ready: robots ") + String(satisfied) + "/" + String(assigned) +
-             (canStartMatch ? ", start permitted" : ", start blocked"));
-    }
   } else if (strcmp(kind, "arenaStatus") == 0) {
     ++wsStatusReceivedCount;
     if (wsStatusReceivedCount == 1) {
@@ -479,15 +463,16 @@ void processArenaText(const uint8_t *payload, size_t length) {
 
 void resetWsFragments() {
   wsFragmentActive = false;
+  wsFragmentIgnored = false;
   wsFragmentOverflow = false;
   wsFragmentBuffer = "";
 }
 
 void appendWsFragment(const uint8_t *payload, size_t length) {
-  if (!wsFragmentActive || wsFragmentOverflow) return;
+  if (!wsFragmentActive || wsFragmentOverflow || wsFragmentIgnored) return;
   if (length > kMaxWsMessageBytes ||
       wsFragmentBuffer.length() > kMaxWsMessageBytes - length ||
-      ESP.getFreeHeap() < length + 16000U) {
+      ESP.getFreeHeap() < length + 12000U) {
     ++wsFragmentErrorCount;
     wsFragmentOverflow = true;
     wsFragmentBuffer = "";
@@ -501,6 +486,14 @@ void appendWsFragment(const uint8_t *payload, size_t length) {
     wsFragmentBuffer = "";
     addLog("Arena WS fragment allocation failed; message discarded");
   }
+}
+
+// Freezy Arena's websocket.Message serializes {"type":...,"data":...} in
+// this order. Identify the type from just the first frame and discard all
+// unrelated Field Monitor messages *without* assembling large JSON documents.
+// The helper is unit-tested with complete, split, and malformed prefixes.
+field_light::WsMessageKind wsKind(const uint8_t *payload, size_t length) {
+  return field_light::classifyWsMessage(payload, length);
 }
 
 void arenaEvent(WStype_t type, uint8_t *payload, size_t length) {
@@ -524,18 +517,37 @@ void arenaEvent(WStype_t type, uint8_t *payload, size_t length) {
     fieldState = -1;
     clearArenaStatus();
   } else if (type == WStype_TEXT && wsConnected) {
-    // Ordinary single-frame message, e.g., matchTime.
     resetWsFragments();
-    wsProcessingFragmented = false;
-    processArenaText(payload, length);
+    const auto kind = wsKind(payload, length);
+    if (kind == field_light::WsMessageKind::Ping ||
+        kind == field_light::WsMessageKind::OtherHeartbeat) {
+      lastFrameMs = millis();
+    } else if (kind == field_light::WsMessageKind::ArenaStatus ||
+               kind == field_light::WsMessageKind::MatchTime) {
+      processArenaText(payload, length);
+    } else {
+      ++wsIgnoredMessages;
+    }
   } else if (type == WStype_FRAGMENT_TEXT_START && wsConnected) {
     resetWsFragments();
-    wsFragmentActive = true;
-    appendWsFragment(payload, length);
+    const auto kind = wsKind(payload, length);
+    wsFragmentIgnored = kind != field_light::WsMessageKind::ArenaStatus &&
+                        kind != field_light::WsMessageKind::MatchTime;
+    if (wsFragmentIgnored) {
+      ++wsIgnoredMessages;
+      if (kind == field_light::WsMessageKind::Ping ||
+          kind == field_light::WsMessageKind::OtherHeartbeat) lastFrameMs = millis();
+    } else {
+      wsFragmentActive = true;
+      // Avoid repeated exponential String reallocations as each 2 KB frame arrives.
+      if (wsFragmentBuffer.capacity() < 16U * 1024U && ESP.getFreeHeap() > 55000U)
+        wsFragmentBuffer.reserve(16U * 1024U);
+      appendWsFragment(payload, length);
+    }
   } else if (type == WStype_FRAGMENT && wsConnected) {
     appendWsFragment(payload, length);
   } else if (type == WStype_FRAGMENT_FIN && wsConnected) {
-    if (wsFragmentActive && !wsFragmentOverflow) {
+    if (wsFragmentActive && !wsFragmentOverflow && !wsFragmentIgnored) {
       appendWsFragment(payload, length);
       if (!wsFragmentOverflow) {
         ++wsFragmentedCount;
@@ -551,9 +563,16 @@ void arenaEvent(WStype_t type, uint8_t *payload, size_t length) {
 
 void beginArenaWebSocket() {
   if (wsStarted || WiFi.status() != WL_CONNECTED || !validHost(config.arenaHost)) return;
-  // All three modes now use the SMALL public arena API stream.
-  // Modes 2/3 require the companion fieldLightStatus FMS notifier patch.
-  wsPath = kMatchWsPath;
+  // Stock Freezy Arena: the public match API carries matchTime only.
+  // The existing Field Monitor display feed also carries arenaStatus (robot
+  // links, bypass, and CanStartMatch). It does NOT need an FMS patch or admin.
+  if (config.monitorMode == field_light::MonitorMode::MatchRunning) {
+    wsPath = kMatchWsPath;
+  } else {
+    const uint32_t id = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
+    wsPath = String(kFieldWsPath) + "?displayId=esp32-fieldlight-" +
+             String(id, HEX) + "&nickname=ESP32-Field-Light";
+  }
   addLog(String("Arena subscription path: ") + wsPath);
   arenaWs.begin(config.arenaHost.c_str(), config.arenaPort, wsPath.c_str());
   // The links2004 WebSocketsClient defaults to "Origin: file://".
@@ -583,7 +602,7 @@ void runArenaSocket() {
       !haveArenaStatus && !wsMissingStatusWarned &&
       static_cast<uint32_t>(millis() - wsConnectedAtMs) > kNoStatusWarningMs) {
     wsMissingStatusWarned = true;
-    addLog("No fieldLightStatus yet: install FMS compact status patch for monitoring modes 2/3");
+    addLog("No arenaStatus received from Field Monitor: check WS diagnostics / fragmentation counters");
   }
   if (wsConnected && static_cast<uint32_t>(millis() - lastFrameMs) > kServerSilenceMs) {
     addLog("Arena heartbeat timed out; reconnecting");
@@ -787,7 +806,10 @@ void statusHandler() {
   doc["arenaPort"] = config.arenaPort;
   doc["wsConnects"] = wsConnects;
   doc["wsDrops"] = wsDrops;
-  doc["arenaStatusFrames"] = wsStatusReceivedCount; // Counts compact readiness updates in v1.5.
+  doc["arenaStatusFrames"] = wsStatusReceivedCount;
+  doc["wsIgnoredMessages"] = wsIgnoredMessages;
+  doc["wsStatusParseErrors"] = wsStatusParseErrors;
+  doc["wsPeakStatusParseMs"] = wsPeakStatusParseMs;
   doc["fragmentedMessages"] = wsFragmentedCount;
   doc["fragmentErrors"] = wsFragmentErrorCount;
   doc["arenaWsPath"] = wsPath;
@@ -975,8 +997,7 @@ void otaUpload() {
   } else if (upload.status == UPLOAD_FILE_END) {
     if (otaStarted && !Update.hasError() && Update.end(true)) {
       otaSucceeded = true;
-      addLog("OTA image verified and written; restarting");
-    } else addLog("OTA image verification / write failed");
+      addLog("OTA image verified and written; restarting");    } else addLog("OTA image verification / write failed");
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Update.abort();
     otaStarted = false;
@@ -997,7 +1018,8 @@ void otaFinish() {
 
 void serveUi() {
   noCache();
-  http.send_P(200, "text/html; charset=utf-8", kWebHtml);}
+  http.send_P(200, "text/html; charset=utf-8", kWebHtml);
+}
 
 void setupHttp() {
   const char *headNames[] = {"Cookie", "X-CSRF-Token"};

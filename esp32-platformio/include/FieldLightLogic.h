@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 // Read-only Freezy Arena match status interpretation for Horner PLC analog inputs.
 // Freezy-Arena/freezy-arena main protocol @ 49d5ceae2d72526bd7414bdb1b1fa45145221e34
@@ -40,6 +41,41 @@ inline const char *monitorModeName(MonitorMode mode) {
     case MonitorMode::FieldReadiness: return "Field readiness";
     default: return "Unknown";
   }
+}
+
+
+// Classify the first WebSocket frame without JSON parsing. Freezy Arena's
+// websocket.Message struct writes `type` before `data`, so a small prefix
+// contains the routing information even for multi-frame payloads.
+enum class WsMessageKind : uint8_t { Ignore, ArenaStatus, MatchTime, Ping, OtherHeartbeat };
+
+inline WsMessageKind classifyWsMessage(const uint8_t *p, size_t size) {
+  if (!p || size < 9) return WsMessageKind::Ignore;
+  const size_t limit = size < 128 ? size : 128;
+  for (size_t i = 0; i + 6 < limit; ++i) {
+    if (p[i] != '"' || p[i+1] != 't' || p[i+2] != 'y' ||
+        p[i+3] != 'p' || p[i+4] != 'e' || p[i+5] != '"') continue;
+    size_t j = i + 6;
+    while (j < limit && (p[j] == ' ' || p[j] == '\t')) ++j;
+    if (j >= limit || p[j++] != ':') continue;
+    while (j < limit && (p[j] == ' ' || p[j] == '\t')) ++j;
+    if (j >= limit || p[j++] != '"') continue;
+    const size_t begin = j;
+    while (j < limit && p[j] != '"') ++j;
+    if (j == limit) return WsMessageKind::Ignore;
+    const size_t n = j - begin;
+    auto same = [&](const char *value, size_t valueLength) {
+      if (n != valueLength) return false;
+      for (size_t k = 0; k < n; ++k) if (p[begin+k] != static_cast<uint8_t>(value[k])) return false;
+      return true;
+    };
+    if (same("arenaStatus", 11)) return WsMessageKind::ArenaStatus;
+    if (same("matchTime", 9)) return WsMessageKind::MatchTime;
+    if (same("ping", 4)) return WsMessageKind::Ping;
+    if (same("matchTiming", 11) || same("matchLoad", 9)) return WsMessageKind::OtherHeartbeat;
+    return WsMessageKind::Ignore;
+  }
+  return WsMessageKind::Ignore;
 }
 
 struct PlcSignalRequest {
