@@ -1,0 +1,70 @@
+FREEZY ARENA - HE-XT102CH / firmware 12.86
+===========================================
+SCREEN GEOMETRY: 160 x 128 pixels, monochrome. Pixel (0,0) = top left.
+The .BMP files are 1-bit STATIC BACKGROUND ARTWORK, not functional HMI screens.
+They can be inserted as Cscape Picture/Graphic objects on screens 1–4.
+Overlay the DYNAMIC objects and BUTTONS described below. If importing the
+bitmaps is cumbersome, recreate the headers and boxes using ordinary Static
+Text and Draw tools; register assignments and PLC logic remain the same.
+
+SCREEN 1  MENU   -> background: 01_menu.bmp
+-------------------------------------------
+  Text Table, %R200, region (50,39)-(153,54): FMS status mapping below
+  Text Table, %R202, region (50,61)-(153,76): output status mapping below
+  Screen Jump touch target (5,93)-(52,122): screen 2 / STATUS
+  Screen Jump touch target (57,93)-(104,122): screen 3 / TEST
+  Screen Jump touch target (109,93)-(155,122): screen 4 / DIAG
+
+SCREEN 2  STATUS -> background: 02_status.bmp
+-------------------------------------------
+  Text Table, %R200, region (64,24)-(154,40): FMS status
+  Text Table, %R201, region (64,47)-(154,63): match status
+  Text Table, %R202, region (64,70)-(154,86): output status
+  Screen Jump touch target (6,99)-(76,123): screen 1 / MENU
+  Screen Jump touch target (84,99)-(154,123): screen 3 / TEST
+
+SCREEN 3  TEST -> background: 03_test.bmp
+----------------------------------------
+  Button/Switch TOUCH, Momentary, write to %T101,
+     target (6,43)-(77,86) / RED;  OFF on release
+  Button/Switch TOUCH, Momentary, write to %T102,
+     target (83,43)-(154,86) / GREEN; OFF on release
+  Text Table, %R203, region (48,88)-(154,101): test state
+  Screen Jump touch target (44,105)-(116,126): screen 1 / MENU
+  NOTE: place the TWO momentary Button/Switch objects ON TOP of any bitmap.
+  The pictures only draw the labels; the touch buttons must be actual objects.
+  Prefer using visible native buttons and allow them to cover the drawn outline
+  so an operator sees tactile pressed/released feedback. You may turn off their
+  separate legends only if buttons remain visibly identifiable.
+
+SCREEN 4  DIAG -> background: 04_diagnostics.bmp
+-------------------------------------------
+  Numeric Data, READ ONLY, %AI1, (84,20)-(154,36): heartbeat raw ADC
+  Numeric Data, READ ONLY, %AI2, (84,39)-(154,55): running raw ADC
+  Numeric Data, READ ONLY, %R204, (84,58)-(154,74): edges since arming (0..2)
+  Text Table, READ ONLY, %R200, (84,77)-(154,93): FMS status
+  Screen Jump touch target (6,104)-(76,124): screen 1 / MENU
+  Screen Jump touch target (84,104)-(154,124): screen 3 / TEST
+
+TEXT TABLES: Set Editable=OFF. Use a SMALL/8pt bitmap compatible font.
+Create each text table separately; enter enum/value pairs below.
+  %R200 FMS:       0 LOST        1 LIVE
+  %R201 MATCH:     0 IDLE        1 RUNNING
+  %R202 OUTPUT:    0 OFF         1 RED        2 GREEN
+  %R203 TEST:      0 READY       1 TEST RED   2 TEST GREEN
+                   3 RUN LOCK    4 TIMEOUT   5 BOTH HELD
+Each entry is value -> text. For a given value in a table, enter exactly
+these values (the Cscape text table rounds up to first >= value).
+
+GRAPHICS OBJECT ORDER:
+  1) Add 160x128 Image/Picture/Graphic BMP in the background, send to back.
+  2) Add live text/numeric objects on TOP of white placeholder fields.
+  3) Add touch screen-jump objects on TOP of drawn menu rectangles.
+     Cscape can use Visible=OFF but allow touchscreen response, if frontmost.
+     Alternatively leave visible and give same legend / fit in rectangle.
+  4) On test screen, create real Button/Switch objects (not screen jumps!)
+     with Momentary action. There is no safety-rated function here.
+
+CAUTION: Firmware 12.86 does not necessarily support newer bitmap fonts
+or options from Cscape 10.2. Use standard classic XLT graphic objects and
+8px / small fonts. Keep overlay objects within placeholder positions.

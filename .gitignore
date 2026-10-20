@@ -1,0 +1,20 @@
+# ESP32 / PlatformIO generated files
+**/.pio/
+**/.vscode/
+**/include/WebUI.h
+*.bin
+*.elf
+*.map
+*.log
+
+# Device secrets and local configuration
+.env
+.env.*
+!*.example
+*.secrets.*
+secrets.*
+*credentials*
+
+# Python
+__pycache__/
+*.pyc

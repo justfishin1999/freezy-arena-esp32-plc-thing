@@ -1,0 +1,88 @@
+(*
+ FREEZY ARENA – XT102 GEN1 / 12.86 – IEC STRUCTURED TEXT V2
+ Combine with variables file 02_GlobalVariables_IEC_V2.txt.
+ This REPLACES the entire original STBlock1. Do not append.
+ Screen controls: momentary %T101 / %T102, screen 3.
+ No physical lamp or ESP32 wiring until verified with safe bench tests.
+*)
+
+(* Analog 0–10V, assumed 0..32000 raw. Hysteresis for 3.3V GPIO *)
+IF HeartbeatRaw >= INT#7500 THEN
+    HeartbeatHigh := TRUE;
+ELSIF HeartbeatRaw <= INT#3500 THEN
+    HeartbeatHigh := FALSE;
+END_IF;
+
+IF RunningRaw >= INT#7500 THEN
+    RunningHigh := TRUE;
+ELSIF RunningRaw <= INT#3500 THEN
+    RunningHigh := FALSE;
+END_IF;
+
+(* Heartbeat must change repeatedly; any stuck level is considered lost *)
+HeartbeatChanged := HeartbeatHigh <> HeartbeatPrevious;
+IF HeartbeatChanged THEN
+    IF HeartbeatEdgeCount < INT#2 THEN
+        HeartbeatEdgeCount := HeartbeatEdgeCount + INT#1;
+    END_IF;
+END_IF;
+NoHeartbeatChange := NOT HeartbeatChanged;
+HeartbeatTimeout(NoHeartbeatChange, INT#30); (* 3s, TON100mS *)
+IF HeartbeatTimeout.Q THEN
+    HeartbeatEdgeCount := INT#0;
+END_IF;
+FmsHealthy := (HeartbeatEdgeCount >= INT#2) AND NOT HeartbeatTimeout.Q;
+
+(* Normal automatic outputs: mutually exclusive, both OFF if link lost *)
+RedRelay := FmsHealthy AND NOT RunningHigh;
+GreenRelay := FmsHealthy AND RunningHigh;
+
+(* Local on-screen tests are MOMENTARY only. A stuck press times out after 5s.
+   No test is permitted with RunningHigh=TRUE, even if the FMS link is lost.
+   Holding both test buttons forces both outputs OFF, never both ON. *)
+TestAnyPressed := TestRedPressed OR TestGreenPressed;
+TestHoldTimeout(TestAnyPressed, INT#50); (* 5s *)
+TestStateCode := INT#0;
+
+IF RunningHigh THEN
+    IF TestAnyPressed THEN
+        TestStateCode := INT#3; (* RUN LOCK *)
+    END_IF;
+ELSIF TestHoldTimeout.Q THEN
+    TestStateCode := INT#4; (* TIMEOUT; must release *)
+ELSIF TestRedPressed AND TestGreenPressed THEN
+    RedRelay := FALSE;
+    GreenRelay := FALSE;
+    TestStateCode := INT#5; (* DUAL PRESS *)
+ELSIF TestRedPressed THEN
+    RedRelay := TRUE;
+    GreenRelay := FALSE;
+    TestStateCode := INT#1; (* TEST RED *)
+ELSIF TestGreenPressed THEN
+    RedRelay := FALSE;
+    GreenRelay := TRUE;
+    TestStateCode := INT#2; (* TEST GREEN *)
+END_IF;
+
+(* Register-backed HMI status; no touchscreen object should write these. *)
+IF FmsHealthy THEN
+    FmsStatusCode := INT#1;   (* LIVE *)
+ELSE
+    FmsStatusCode := INT#0;   (* LOST *)
+END_IF;
+
+IF RunningHigh THEN
+    MatchStatusCode := INT#1; (* RUNNING *)
+ELSE
+    MatchStatusCode := INT#0; (* IDLE / UNKNOWN if FMS lost *)
+END_IF;
+
+OutputStatusCode := INT#0;    (* OFF *)
+IF RedRelay THEN
+    OutputStatusCode := INT#1; (* RED *)
+ELSIF GreenRelay THEN
+    OutputStatusCode := INT#2; (* GREEN *)
+END_IF;
+
+EdgeCountDisplay := HeartbeatEdgeCount;
+HeartbeatPrevious := HeartbeatHigh;

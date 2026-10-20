@@ -1,0 +1,31 @@
+(* REPLACE the full GLOBAL VAR..END_VAR section with this block.
+   Import in IEC Variables Editor (Global) -> IEC Format.
+   Check all physical/virtual tags in the variable grid after save. *)
+VAR
+    HeartbeatRaw : INT; (*$tag=%AI1*)
+    RunningRaw : INT; (*$tag=%AI2*)
+    RedRelay : BOOL; (*$tag=%Q1*)
+    GreenRelay : BOOL; (*$tag=%Q2*)
+
+    (* XLT touch buttons: non-retentive memory, not physical inputs *)
+    TestRedPressed : BOOL := FALSE; (*$tag=%T101*)
+    TestGreenPressed : BOOL := FALSE; (*$tag=%T102*)
+
+    (* Read-only screen status words *)
+    FmsStatusCode : INT := INT#0; (*$tag=%R200*)
+    MatchStatusCode : INT := INT#0; (*$tag=%R201*)
+    OutputStatusCode : INT := INT#0; (*$tag=%R202*)
+    TestStateCode : INT := INT#0; (*$tag=%R203*)
+    EdgeCountDisplay : INT := INT#0; (*$tag=%R204*)
+
+    HeartbeatHigh : BOOL := FALSE;
+    HeartbeatPrevious : BOOL := FALSE;
+    RunningHigh : BOOL := FALSE;
+    HeartbeatChanged : BOOL := FALSE;
+    NoHeartbeatChange : BOOL := TRUE;
+    HeartbeatEdgeCount : INT := INT#0;
+    FmsHealthy : BOOL := FALSE;
+    HeartbeatTimeout : TON100mS;
+    TestAnyPressed : BOOL := FALSE;
+    TestHoldTimeout : TON100mS;
+END_VAR
