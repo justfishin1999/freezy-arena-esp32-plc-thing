@@ -1,41 +1,61 @@
-# Freezy Arena — ESP32 + Horner PLC Field Light
+# Freezy Arena · ESP32 Direct Dual Relay
 
-An ESP32 Wi-Fi gateway that monitors **unmodified Freezy Arena** and drives the analog inputs of a **Horner HE-XT102CH** PLC for a two-color field-status stack light. The Horner switches the relays and implements the heartbeat watchdog; the ESP32 never powers the stack light directly.
+**This is the `direct-dual-relay-field-monitor` branch.** The Horner PLC version
+remains intact on `main`. The standalone ESP32 monitors an **unmodified** Freezy Arena server.
 
-**No Freezy Arena patches or server-side configuration changes are required.** The gateway uses the FMS’s existing WebSocket endpoints.
+## Relay behavior
 
-## Components
+| Condition | Relay 1 (GPIO26) — Robot fault | Relay 2 (GPIO27) — FMS health |
+| --- | --- | --- |
+| FMS connected; every assigned robot linked or station bypassed | OFF | ON |
+| FMS connected; a required robot disconnects mid-match (or E-stop) | ON | ON |
+| FMS disconnected or `arenaStatus` older than 4 seconds | ON | FLASH: 1 s ON / 1 s OFF |
 
-- **`esp32-platformio/`** — PlatformIO ESP32 firmware, management dashboard, monitoring logic, tests and wiring instructions.
-- **`horner-plc/`** — Cscape Structured Text source and HMI documentation (not a compiled PGM or CSP project).
+These are **independent** outputs: both may be ON simultaneously. Neither
+depends on whether a match is actually running. Freezy Arena publishes robot
+`RobotLinked`, `Bypass`, `EStop`, and assigned team information through its
+existing `/displays/field_monitor/websocket` endpoint, which our ESP32 subscribes
+to in read-only mode. No server modifications are needed.
 
-## Monitoring modes
+Unassigned stations are ignored. A bypassed assigned station counts as ready
+unless E-stopped. With zero assigned teams the indicator conservatively reports
+a robot-not-ready fault.
 
-1. **Match running** — uses `/api/arena/websocket`; red while idle, green while a match is running.
-2. **Robot connectivity** — uses the existing `/displays/field_monitor/websocket` stream; green when each **assigned** robot is linked or its station is bypassed, with no E-stop; red otherwise. Unassigned stations are ignored.
-3. **Field readiness** — uses the same existing Field Monitor stream; green when `CanStartMatch` is true, or a match is running; red otherwise.
+## Hardware setup
 
-The ESP32 processes only the useful FMS `arenaStatus` and `matchTime` messages and discards unrelated high-volume display messages without deserializing them. It supports fragmented WebSocket frames. The Field Monitor WebSocket registers a named ESP32 display in the FMS display registry. This is a read-only connection.
+Use **two 5 V, high-level-trigger relay modules**, with **H** selected on both
+modules' jumpers:
 
-The stack light's internal flasher creates the flashing effect. When the FMS WebSocket disconnects, or its heartbeat is stale, both GPIO requests go LOW and the Horner PLC watchdog turns both lamps off. While a healthy FMS connection is established but readiness details have not arrived, Modes 2/3 show RED rather than suggesting the field is ready. This is **not** a safety-rated control, E-stop, or protective device.
+| ESP32/power | Relay board terminal | Role |
+| --- | --- | --- |
+| GPIO26 / P26 | Relay 1 `IN` | Robot fault |
+| GPIO27 / P27 | Relay 2 `IN` | FMS health |
+| Regulated 5 V | Both `DC+` | Relay coil power |
+| Real ESP32 GND | Both `DC−` | Shared low-voltage reference |
 
-## Wiring
+Use the isolated `COM` and `NO` contacts on each relay to switch your
+12 V stack light circuits. The GPIO output is 3.3 V and controls the relay
+input only; it does **not** provide coil power. The two modules used during
+prototyping worked reliably in HIGH-trigger mode. Do **not** use the ESP32
+flash-memory `CMD` pin as ground.
 
-| ESP32 | Horner | Purpose |
-|---|---|---|
-| GPIO26 | A1 (0–10 V mode) | Heartbeat (toggles every 1 sec) |
-| GPIO27 | A2 (0–10 V mode) | Green / running request (HIGH = green) |
-| GND | 0 V | Shared signal reference |
+## Build and test
 
-Verify the Horner's physical JP2 voltage-mode jumpers before connecting, establish compatible power references, and **never** connect PLC 24 V positive to ESP32 GPIO. See [`esp32-platformio/docs/ESP32_TO_HORNER_WIRING.md`](esp32-platformio/docs/ESP32_TO_HORNER_WIRING.md).
+1. Open the `esp32-platformio/` folder in VS Code/PlatformIO.
+2. Run **Clean → Build → Upload** for `esp32dev`, or upload the compiled
+   `.pio/build/esp32dev/firmware.bin` through the ESP32 dashboard.
+3. Configure Wi-Fi and Freezy Arena IP/port in the dashboard.
+4. Use the tests **Relay 1**, **Relay 2**, **Both ON**, **FMS outage pattern**,
+   **Both OFF**, and **Return AUTO**. Tests last no more than 15 seconds and
+   are disabled during a running FMS match.
+5. Verify `arenaStatus` counter advances under Diagnostics, and test a
+   disconnected robot plus unplugging FMS network access.
 
-## Build and deploy
+Existing Wi-Fi credentials and management login remain in ESP32 NVS. Pin
+preferences stay configurable (defaults GPIO26/27). This is a status accessory,
+**not a safety-rated device**. During ESP32 power loss or reset, the controller
+cannot energize or blink relays. Frequent mechanical-relay blinking shortens
+contact/coil life; for long outages consider the tower's own LED flasher or an
+appropriately rated solid-state output instead.
 
-1. Open **`esp32-platformio/`** in VS Code/PlatformIO and run Clean → Build → Upload. `tools/embed_web.py` generates `include/WebUI.h` during build.
-2. Use the ESP32 management UI to set Wi-Fi, FMS hostname/port and the monitoring mode. The mode is saved in NVS and settings persist between firmware updates.
-3. Check Diagnostics for the active FMS WebSocket path, `arenaStatus` frame count, fragmented message count, parse errors and heartbeat output.
-4. Verify each mode in a controlled field test and verify the heartbeat stops on FMS disconnect.
-
-No Freezy Arena changes and no Horner PLC changes are needed. The ESP32 project has native logic tests; a complete ESP32 toolchain build and physical FMS/PLC integration test should be completed before event use.
-
-Do not commit device exports, Wi-Fi credentials or management passwords.
+No changes have been made to the original `Freezy-Arena/freezy-arena` FMS repository.

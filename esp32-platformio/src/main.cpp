@@ -48,7 +48,6 @@ struct Settings {
   uint16_t arenaPort = kArenaPortDefault;
   uint8_t heartbeatPin = 26;
   uint8_t runningPin = 27;
-  field_light::MonitorMode monitorMode = field_light::MonitorMode::MatchRunning;
 };
 
 struct EventLine {
@@ -188,9 +187,6 @@ void loadConfig() {
   config.arenaPort = prefs.getUShort("port", kArenaPortDefault);
   config.heartbeatPin = prefs.getUChar("hbPin", prefs.getUChar("redPin", 26));
   config.runningPin = prefs.getUChar("runPin", prefs.getUChar("greenPin", 27));
-  uint8_t mode = prefs.getUChar("monMode", 1);
-  config.monitorMode = (mode >= 1 && mode <= 3) ?
-    static_cast<field_light::MonitorMode>(mode) : field_light::MonitorMode::MatchRunning;
   // Migrate settings from the original GPIO relay edition if they exist.
   // New keys take priority; no active-low option on 0-10V PLC signals.
   if (!validPin(config.heartbeatPin) || !validPin(config.runningPin) ||
@@ -776,7 +772,6 @@ void statusHandler() {
   doc["fragmentErrors"] = wsFragmentErrorCount;
   doc["arenaWsPath"] = wsPath;
   doc["frameAgeSec"] = wsConnected ? static_cast<int>((millis() - lastFrameMs) / 1000) : -1;
-  doc["monitorMode"] = static_cast<int>(config.monitorMode);
   doc["monitorModeName"] = "Dual-relay fault + FMS";
   doc["arenaStatusFresh"] = freshArenaStatus();
   doc["robotReady"] = freshArenaStatus() && robotsReady;
@@ -811,7 +806,6 @@ void configHandler() {
   doc["arenaPort"] = config.arenaPort;
   doc["heartbeatPin"] = config.heartbeatPin;
   doc["runningPin"] = config.runningPin;
-  doc["monitorMode"] = static_cast<int>(config.monitorMode);
   doc["linkType"] = "2x independent active-HIGH 5V relay modules";
   doc["wifiPasswordSet"] = config.wifiPassword.length() > 0;
   sendJson(200, doc);
@@ -826,7 +820,6 @@ void saveConfigHandler() {
   const int port = data["arenaPort"].as<int>();
   const int hbPin = data["heartbeatPin"].as<int>();
   const int runPin = data["runningPin"].as<int>();
-  const int monitorMode = data["monitorMode"].as<int>();
   if (ssid.length() > 32 || (ssid.length() == 0 && !config.ssid.isEmpty())) {
     sendMessage(400, "Wi-Fi SSID must be 1-32 characters"); return;
   }
@@ -834,9 +827,6 @@ void saveConfigHandler() {
   if (port < 1 || port > 65535) { sendMessage(400, "Arena port must be between 1 and 65535"); return; }
   if (!validPin(hbPin) || !validPin(runPin) || hbPin == runPin) {
     sendMessage(400, "Choose distinct safe output pins (GPIO33 reserved)"); return;
-  }
-  if (monitorMode < 1 || monitorMode > 3) {
-    sendMessage(400, "Select a valid monitoring mode (1-3)"); return;
   }
   String pass = data["wifiPassword"].as<String>();
   if (pass.length() > 63) { sendMessage(400, "Wi-Fi password too long"); return; }
@@ -852,7 +842,6 @@ void saveConfigHandler() {
   prefs.putUShort("port", static_cast<uint16_t>(port));
   prefs.putUChar("hbPin", static_cast<uint8_t>(hbPin));
   prefs.putUChar("runPin", static_cast<uint8_t>(runPin));
-  prefs.putUChar("monMode", static_cast<uint8_t>(monitorMode));
   stopManualTest("Saved settings: stopping any manual test");
   setRelays(false, false);
   addLog("Settings saved; reboot scheduled");
