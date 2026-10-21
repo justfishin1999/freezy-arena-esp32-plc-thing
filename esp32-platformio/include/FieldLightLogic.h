@@ -100,4 +100,16 @@ inline PlcSignalRequest signalsForMode(MonitorMode mode, FieldPhase phase, int m
                     (statusFresh && matchState == PreMatch && canStart)};
   return {false, false};
 }
+// Two independent relays. Missing/stale status is a fault even if the
+// WebSocket TCP connection appears to be open.
+struct DualRelayRequest { bool robotFault; bool fmsConnected; bool flashFmsRelay; };
+inline DualRelayRequest dualRelayRequest(bool freshStatus, bool robotsReady) {
+  if (!freshStatus) return {true, false, true};
+  return {!robotsReady, true, false};
+}
+inline bool healthRelayOutput(DualRelayRequest requested, uint32_t now,
+                              uint32_t blinkHalfCycleMs = 1000) {
+  if (!requested.flashFmsRelay) return requested.fmsConnected;
+  return blinkHalfCycleMs != 0 && (now / blinkHalfCycleMs) % 2U == 0;
+}
 }  // namespace field_light

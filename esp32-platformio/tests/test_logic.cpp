@@ -53,6 +53,18 @@ int main() {
   uint32_t nearWrap = 0xFFFFFF00U;
   uint32_t afterWrap = 800U;
   assert(uint32_t(afterWrap - nearWrap) == 1056U);
+  const auto well = dualRelayRequest(true, true);
+  assert(!well.robotFault && well.fmsConnected && !well.flashFmsRelay);
+  assert(healthRelayOutput(well, 1000));
+  const auto robotLost = dualRelayRequest(true, false);
+  assert(robotLost.robotFault && robotLost.fmsConnected && !robotLost.flashFmsRelay);
+  assert(healthRelayOutput(robotLost, 8000)); // both relays may be ON
+  const auto fmsLost = dualRelayRequest(false, true);
+  assert(fmsLost.robotFault && !fmsLost.fmsConnected && fmsLost.flashFmsRelay);
+  assert(healthRelayOutput(fmsLost, 0));
+  assert(!healthRelayOutput(fmsLost, 1000));
+  assert(healthRelayOutput(fmsLost, 2000));
+  assert(!healthRelayOutput(fmsLost, 3000));
   // Stock Freezy Arena websocket envelope. Skip scores and other large
   // display data before buffering or deserializing (prevents slow listeners).
   auto identify = [](const char *data) {

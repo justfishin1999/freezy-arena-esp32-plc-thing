@@ -1,7 +1,7 @@
 name: ESP32 firmware build
 on:
   push:
-    branches: [main]
+    branches: [main, direct-dual-relay-field-monitor]
   pull_request:
 
 jobs:

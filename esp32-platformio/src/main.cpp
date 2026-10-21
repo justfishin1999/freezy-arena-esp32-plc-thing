@@ -1,8 +1,9 @@
-// Freezy Arena ESP32 -> Horner HE-XT102CH analog-input gateway.
-// Outputs are 3.3V LOGIC signals ONLY, never 12/24V.
-// Horner A1=heartbeat, A2=running; common 0V reference and voltage-mode inputs.
-// Upstream state protocol: Freezy-Arena/freezy-arena main @ 49d5ceae2d72526bd7414bdb1b1fa45145221e34.
-// No direct ESP32 relay drive. PLC controls its onboard dry-contact relays.
+// Freezy Arena standalone dual-relay ESP32 gateway.
+// GPIO26: robot fault relay; GPIO27: FMS status relay.
+// Tested single-channel 5V relay modules set to HIGH trigger. The GPIO
+// signals only drive relay IN; relay coils get separate 5V/GND power.
+// Subscribe to Freezy Arena's existing Field Monitor WebSocket, no server patch. 
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
@@ -19,7 +20,7 @@
 #include "WebUI.h"
 
 namespace {
-constexpr const char *kVersion = "2026.10.20.plc1.6";
+constexpr const char *kVersion = "2026.10.21.relay1.0";
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kArenaPortDefault = 8080;
 constexpr uint32_t kServerSilenceMs = 30000;
@@ -30,7 +31,7 @@ constexpr size_t kMaxWsMessageBytes = 64U * 1024U;
 constexpr uint32_t kNoStatusWarningMs = 8000;
 constexpr uint32_t kWifiAttemptMs = 12000;
 constexpr uint32_t kTestDurationMs = 15000;
-constexpr uint32_t kHeartbeatHalfCycleMs = 1000;
+constexpr uint32_t kRelayFlashHalfCycleMs = 1000; // 1s ON / 1s OFF on FMS loss
 constexpr uint32_t kSessionIdleMs = 30UL * 60UL * 1000UL;
 constexpr uint32_t kButtonHoldMs = 10000;
 constexpr uint32_t kApAfterWifiLostMs = 15000;
@@ -114,6 +115,11 @@ uint32_t buttonDownSince = 0;
 bool resetButtonActivated = false;
 
 bool manualActive = false;
+bool manualBlink = false;
+bool relay2Blinking = false;
+bool lastBlinkMode = false;
+bool lastRobotFault = false;
+bool lastFmsConnected = false;
 field_light::PlcSignalRequest manualCommand{false, false};
 uint32_t manualUntilMs = 0;
 uint32_t rebootAtMs = 0;
@@ -233,9 +239,8 @@ void resetCredentials() {
   rebootAtMs = millis() + 600;
 }
 
-// The PLC's A1 and A2 MUST be set to 0-10V voltage input mode.
-// Logic HIGH is ESP32 3.3V; logic LOW is 0V. Both GPIOs start LOW.
-void initializePlcPins() {
+// Set relay control GPIOs LOW before configuring output. H trigger = HIGH ON.
+void initializeRelayPins() {
   digitalWrite(config.heartbeatPin, LOW);
   digitalWrite(config.runningPin, LOW);
   pinMode(config.heartbeatPin, OUTPUT);
@@ -245,41 +250,15 @@ void initializePlcPins() {
   plcLinkEnabled = false;
   redOn = false;
   greenOn = false;
-  lastHeartbeatToggleMs = millis();
 }
-
-// PLC has a 3s independently changing-heartbeat watchdog. Stop the heartbeat
-// immediately on FMS loss; both physical relays will drop after PLC timeout.
-void drivePlc(bool linkEnabled, bool running) {
-  if (!linkEnabled) {
-    digitalWrite(config.runningPin, LOW);
-    digitalWrite(config.heartbeatPin, LOW);
-    heartbeatLevelHigh = false;
-    runningLevelHigh = false;
-    plcLinkEnabled = false;
-    redOn = false;
-    greenOn = false;
-    return;
-  }
-
-  // The first edge occurs 1s after enable. Two edges qualify PLC connection.
-  if (!plcLinkEnabled) {
-    digitalWrite(config.heartbeatPin, LOW);
-    heartbeatLevelHigh = false;
-    lastHeartbeatToggleMs = millis();
-  }
-  if (static_cast<uint32_t>(millis() - lastHeartbeatToggleMs) >= kHeartbeatHalfCycleMs) {
-    heartbeatLevelHigh = !heartbeatLevelHigh;
-    digitalWrite(config.heartbeatPin, heartbeatLevelHigh ? HIGH : LOW);
-    lastHeartbeatToggleMs = millis();
-  }
-  if (runningLevelHigh != running) {
-    digitalWrite(config.runningPin, running ? HIGH : LOW);
-    runningLevelHigh = running;
-  }
-  plcLinkEnabled = true;
-  redOn = !running;
-  greenOn = running;
+void setRelays(bool robotFault, bool fmsHealth) {
+  // Both independent relays are allowed to energize simultaneously.
+  if (redOn != robotFault) digitalWrite(config.heartbeatPin, robotFault ? HIGH : LOW);
+  if (greenOn != fmsHealth) digitalWrite(config.runningPin, fmsHealth ? HIGH : LOW);
+  redOn = robotFault;
+  greenOn = fmsHealth;
+  heartbeatLevelHigh = robotFault;
+  runningLevelHigh = fmsHealth;
 }
 
 bool freshField() {
@@ -299,7 +278,7 @@ field_light::FieldPhase fieldPhase() {
 }
 
 bool freshArenaStatus() {
-  return freshField() && haveArenaStatus &&
+  return WiFi.status() == WL_CONNECTED && wsConnected && haveArenaStatus &&
       static_cast<uint32_t>(millis() - lastArenaStatusMs) < kArenaStatusStaleMs;
 }
 
@@ -320,36 +299,30 @@ void stopManualTest(const String &reason) {
 }
 
 void updateOutputs() {
-  if (otaStarted || rebootAtMs) {
-    drivePlc(false, false);
-    return;
+  if (otaStarted || rebootAtMs) { setRelays(false, false); return; }
+  if (manualActive && static_cast<int32_t>(millis() - manualUntilMs) >= 0)
+    stopManualTest("Relay test expired; automatic control restored");
+  if (manualActive && fieldPhase() == field_light::FieldPhase::Running)
+    stopManualTest("Relay test cancelled: match started");
+
+  const bool fmsLive = freshArenaStatus();
+  const field_light::DualRelayRequest plan = manualActive
+      ? field_light::DualRelayRequest{manualCommand.heartbeatEnabled,
+                                     manualCommand.runningHigh, manualBlink}
+      : field_light::dualRelayRequest(fmsLive, robotsReady);
+  const bool output2 = field_light::healthRelayOutput(
+      plan, millis(), kRelayFlashHalfCycleMs);
+  if (plan.robotFault != lastRobotFault || plan.fmsConnected != lastFmsConnected ||
+      plan.flashFmsRelay != lastBlinkMode) {
+    addLog(String("Relays: R1 fault ") + (plan.robotFault ? "ON" : "OFF") +
+           ", R2 FMS " + (plan.flashFmsRelay ? "FLASH" : plan.fmsConnected ? "ON" : "OFF"));
+    lastRobotFault = plan.robotFault;
+    lastFmsConnected = plan.fmsConnected;
+    lastBlinkMode = plan.flashFmsRelay;
   }
-  if (manualActive && static_cast<int32_t>(millis() - manualUntilMs) >= 0) {
-    stopManualTest("Web test expired; returned to automatic control");
-  }
-  // Never allow a web manual test to override a real active FMS match.
-  if (manualActive && fieldPhase() == field_light::FieldPhase::Running) {
-    stopManualTest("Web test cancelled: Arena match started");
-  }
-  bool linkEnabled = false;
-  bool running = false;
-  if (manualActive) {
-    linkEnabled = manualCommand.heartbeatEnabled;
-    running = manualCommand.runningHigh;
-  } else {
-    const auto desired = field_light::signalsForMode(
-        config.monitorMode, fieldPhase(), fieldState, freshArenaStatus(),
-        robotsReady, canStartMatch);
-    linkEnabled = desired.heartbeatEnabled;
-    running = desired.runningHigh;
-  }
-  const bool stateChanged = (redOn != (linkEnabled && !running)) ||
-                            (greenOn != (linkEnabled && running));
-  drivePlc(linkEnabled, running);
-  if (stateChanged) {
-    addLog(String("PLC desired: ") + (redOn ? "RED / heartbeat active" :
-             greenOn ? "GREEN / heartbeat active" : "both OFF after PLC watchdog"));
-  }
+  relay2Blinking = plan.flashFmsRelay;
+  plcLinkEnabled = fmsLive;
+  setRelays(plan.robotFault, output2);
 }
 
 // Decode a complete logical text message. A single JSON document may arrive
@@ -563,27 +536,17 @@ void arenaEvent(WStype_t type, uint8_t *payload, size_t length) {
 
 void beginArenaWebSocket() {
   if (wsStarted || WiFi.status() != WL_CONNECTED || !validHost(config.arenaHost)) return;
-  // Stock Freezy Arena: the public match API carries matchTime only.
-  // The existing Field Monitor display feed also carries arenaStatus (robot
-  // links, bypass, and CanStartMatch). It does NOT need an FMS patch or admin.
-  if (config.monitorMode == field_light::MonitorMode::MatchRunning) {
-    wsPath = kMatchWsPath;
-  } else {
-    const uint32_t id = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
-    wsPath = String(kFieldWsPath) + "?displayId=esp32-fieldlight-" +
-             String(id, HEX) + "&nickname=ESP32-Field-Light";
-  }
+  const uint32_t id = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFFFFULL);
+  wsPath = String(kFieldWsPath) + "?displayId=esp32-dualrelay-" +
+           String(id, HEX) + "&nickname=ESP32-Dual-Relay";
   addLog(String("Arena subscription path: ") + wsPath);
   arenaWs.begin(config.arenaHost.c_str(), config.arenaPort, wsPath.c_str());
-  // The links2004 WebSocketsClient defaults to "Origin: file://".
-  // Gorilla WebSocket on Freezy Arena rejects that cross-origin header.
-  // Non-browser devices should omit Origin; leave the server origin check intact.
-  arenaWs.setExtraHeaders("");
+  arenaWs.setExtraHeaders(""); // prevent Origin:file:// rejection by Gorilla
   arenaWs.onEvent(arenaEvent);
   arenaWs.setReconnectInterval(3000);
   wsStarted = true;
-  addLog("Connecting to Freezy Arena " + config.arenaHost + ":" + String(config.arenaPort) +
-         " (" + field_light::monitorModeName(config.monitorMode) + ")");
+  addLog("Connecting to Freezy Arena " + config.arenaHost + ":" +
+         String(config.arenaPort) + " (two-relay status)");
 }
 
 void runArenaSocket() {
@@ -598,8 +561,7 @@ void runArenaSocket() {
   beginArenaWebSocket();
   if (!wsStarted) return;
   arenaWs.loop();
-  if (wsConnected && haveState && config.monitorMode != field_light::MonitorMode::MatchRunning &&
-      !haveArenaStatus && !wsMissingStatusWarned &&
+  if (wsConnected && !haveArenaStatus && !wsMissingStatusWarned &&
       static_cast<uint32_t>(millis() - wsConnectedAtMs) > kNoStatusWarningMs) {
     wsMissingStatusWarned = true;
     addLog("No arenaStatus received from Field Monitor: check WS diagnostics / fragmentation counters");
@@ -800,7 +762,7 @@ void statusHandler() {
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
   doc["apActive"] = apRunning;
   doc["apSsid"] = apRunning ? apName() : "";
-  doc["arenaConnected"] = wsConnected && freshField();
+  doc["arenaConnected"] = freshArenaStatus();
   doc["arenaSocket"] = wsConnected;
   doc["arenaHost"] = config.arenaHost;
   doc["arenaPort"] = config.arenaPort;
@@ -815,7 +777,7 @@ void statusHandler() {
   doc["arenaWsPath"] = wsPath;
   doc["frameAgeSec"] = wsConnected ? static_cast<int>((millis() - lastFrameMs) / 1000) : -1;
   doc["monitorMode"] = static_cast<int>(config.monitorMode);
-  doc["monitorModeName"] = field_light::monitorModeName(config.monitorMode);
+  doc["monitorModeName"] = "Dual-relay fault + FMS";
   doc["arenaStatusFresh"] = freshArenaStatus();
   doc["robotReady"] = freshArenaStatus() && robotsReady;
   doc["robotsAssigned"] = freshArenaStatus() ? robotsAssigned : 0;
@@ -830,6 +792,9 @@ void statusHandler() {
   doc["manualRemaining"] = manualActive ? (static_cast<uint32_t>(manualUntilMs - millis()) / 1000) : 0;
   doc["red"] = redOn;
   doc["green"] = greenOn;
+  doc["relay2Blinking"] = relay2Blinking;
+  doc["relay1On"] = redOn;
+  doc["relay2On"] = greenOn;
   doc["plcLinkEnabled"] = plcLinkEnabled;
   doc["heartbeatLevelHigh"] = heartbeatLevelHigh;
   doc["runningLevelHigh"] = runningLevelHigh;
@@ -847,7 +812,7 @@ void configHandler() {
   doc["heartbeatPin"] = config.heartbeatPin;
   doc["runningPin"] = config.runningPin;
   doc["monitorMode"] = static_cast<int>(config.monitorMode);
-  doc["linkType"] = "XT102CH analog 0-10V";
+  doc["linkType"] = "2x independent active-HIGH 5V relay modules";
   doc["wifiPasswordSet"] = config.wifiPassword.length() > 0;
   sendJson(200, doc);
 }
@@ -889,7 +854,7 @@ void saveConfigHandler() {
   prefs.putUChar("runPin", static_cast<uint8_t>(runPin));
   prefs.putUChar("monMode", static_cast<uint8_t>(monitorMode));
   stopManualTest("Saved settings: stopping any manual test");
-  drivePlc(false, false);
+  setRelays(false, false);
   addLog("Settings saved; reboot scheduled");
   sendMessage(200, "Settings saved; device rebooting");
   rebootAtMs = millis() + 1300;
@@ -906,19 +871,21 @@ void manualTestHandler() {
     sendMessage(200, "Automatic control restored");
     return;
   }
-  if (mode != "red" && mode != "green" && mode != "off") {
-    sendMessage(400, "Choose red, green, off or auto"); return;
+  if (mode != "red" && mode != "green" && mode != "both" &&
+      mode != "outage" && mode != "off") {
+    sendMessage(400, "Choose red, green, both, outage, off, or auto"); return;
   }
   if (fieldPhase() == field_light::FieldPhase::Running) {
-    sendMessage(409, "Testing disabled during an active Arena match");
-    return;
+    sendMessage(409, "Testing disabled while an actual match runs"); return;
   }
-  manualCommand = {mode != "off", mode == "green"};
+  manualCommand = {mode == "red" || mode == "both" || mode == "outage",
+                   mode == "green" || mode == "both"};
+  manualBlink = (mode == "outage");
   manualActive = true;
   manualUntilMs = millis() + kTestDurationMs;
   updateOutputs();
-  addLog("PLC test started (15 s maximum): " + mode);
-  sendMessage(200, "PLC signal test active; auto-expires in 15 seconds");
+  addLog("Direct relay test active for 15 seconds: " + mode);
+  sendMessage(200, "Relay test active; returns to automatic in 15 seconds");
 }
 
 void logHandler() {
@@ -967,7 +934,7 @@ void apHandler() {
 void rebootHandler() {
   if (!requireWriteAuth()) return;
   stopManualTest("Reboot requested");
-  drivePlc(false, false);
+  setRelays(false, false);
   sendMessage(200, "Rebooting");
   rebootAtMs = millis() + 750;
 }
@@ -985,7 +952,7 @@ void otaUpload() {
     otaStarted = true;
     otaSucceeded = false;
     stopManualTest("Firmware update started");
-    drivePlc(false, false);
+    setRelays(false, false);
     addLog("OTA firmware upload started");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
       addLog("OTA initialization failed");
@@ -1062,10 +1029,10 @@ void setup() {
   Serial.printf("\nFreezy Arena Field Light %s - ESP32\n", kVersion);
   prefs.begin("field-light", false);
   loadConfig();
-  initializePlcPins();
+  initializeRelayPins();
   pinMode(kButtonPin, INPUT_PULLUP);
   ensureCredentials();
-  addLog("Boot: Horner analog outputs LOW (A1 heartbeat / A2 match-running)");
+  addLog("Boot: 2 relay GPIOs LOW; R1=robot fault, R2=FMS healthy");
   WiFi.persistent(false);
   WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
@@ -1081,7 +1048,7 @@ void loop() {
   updateOutputs();
   http.handleClient();
   if (rebootAtMs && static_cast<int32_t>(millis() - rebootAtMs) >= 0) {
-    drivePlc(false, false);
+    setRelays(false, false);
     delay(40);
     ESP.restart();
   }
