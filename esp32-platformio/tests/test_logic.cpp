@@ -53,18 +53,35 @@ int main() {
   uint32_t nearWrap = 0xFFFFFF00U;
   uint32_t afterWrap = 800U;
   assert(uint32_t(afterWrap - nearWrap) == 1056U);
-  const auto well = dualRelayRequest(true, true);
-  assert(!well.robotFault && well.fmsConnected && !well.flashFmsRelay);
-  assert(healthRelayOutput(well, 1000));
-  const auto robotLost = dualRelayRequest(true, false);
-  assert(robotLost.robotFault && robotLost.fmsConnected && !robotLost.flashFmsRelay);
-  assert(healthRelayOutput(robotLost, 8000)); // both relays may be ON
-  const auto fmsLost = dualRelayRequest(false, true);
-  assert(fmsLost.robotFault && !fmsLost.fmsConnected && fmsLost.flashFmsRelay);
-  assert(healthRelayOutput(fmsLost, 0));
-  assert(!healthRelayOutput(fmsLost, 1000));
-  assert(healthRelayOutput(fmsLost, 2000));
-  assert(!healthRelayOutput(fmsLost, 3000));
+  // No assigned teams and no stops -> no lights.
+  StationStopState stations[6] = {
+    {true, false, false}, {true, false, false}, {true, false, false},
+    {true, false, false}, {true, false, false}, {false, true, true}
+  };
+  auto outputs = stopRelaysForStations(true, stations, 6);
+  assert(!outputs.redEStop && !outputs.greenAStop); // ignore unassigned station
+  stations[1].eStopped = true;
+  outputs = stopRelaysForStations(true, stations, 6);
+  assert(outputs.redEStop && !outputs.greenAStop);
+  stations[4].aStopped = true;
+  outputs = stopRelaysForStations(true, stations, 6);
+  assert(outputs.redEStop && outputs.greenAStop); // different teams can trigger both
+  stations[1].eStopped = false;
+  outputs = stopRelaysForStations(true, stations, 6);
+  assert(!outputs.redEStop && outputs.greenAStop);
+  stations[4].aStopped = false;
+  stations[2].eStopped = true;
+  stations[2].aStopped = true;
+  outputs = stopRelaysForStations(true, stations, 6);
+  assert(outputs.redEStop && outputs.greenAStop); // one team can trigger both
+  outputs = stopRelaysForStations(false, stations, 6);
+  assert(!outputs.redEStop && !outputs.greenAStop); // FMS lost -> unknown, neither asserted
+  outputs = stopRelaysForStations(true, nullptr, 6);
+  assert(!outputs.redEStop && !outputs.greenAStop);
+  stations[2].assigned = false;
+  outputs = stopRelaysForStations(true, stations, 6);
+  assert(!outputs.redEStop && !outputs.greenAStop);
+
   // Stock Freezy Arena websocket envelope. Skip scores and other large
   // display data before buffering or deserializing (prevents slow listeners).
   auto identify = [](const char *data) {
@@ -82,5 +99,5 @@ int main() {
   assert(identify("{\"type\":\"bogus\"}") == WsMessageKind::Ignore);
   assert(identify("{\"type\":\"arenaSta") == WsMessageKind::Ignore);
   assert(identify("") == WsMessageKind::Ignore);
-  std::cout << "Freezy Arena ESP32 PLC phase-to-signal mapping: PASS\n";
+  std::cout << "Freezy Arena ESP32 E-stop and A-stop mapping: PASS\n";
 }

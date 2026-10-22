@@ -112,4 +112,28 @@ inline bool healthRelayOutput(DualRelayRequest requested, uint32_t now,
   if (!requested.flashFmsRelay) return requested.fmsConnected;
   return blinkHalfCycleMs != 0 && (now / blinkHalfCycleMs) % 2U == 0;
 }
+
+// Each Freezy Arena alliance station has independent EStop and AStop flags.
+// Unassigned stations cannot represent a team stop, so ignore those.
+// No inferred stop or flashing if the feed is unavailable; status is UNKNOWN.
+struct StationStopState {
+  bool assigned;
+  bool eStopped;
+  bool aStopped;
+};
+struct StopRelayRequest {
+  bool redEStop;
+  bool greenAStop;
+};
+inline StopRelayRequest stopRelaysForStations(bool statusFresh,
+    const StationStopState *stations, size_t count) {
+  StopRelayRequest request{false, false};
+  if (!statusFresh || !stations) return request;
+  for (size_t i = 0; i < count; ++i) {
+    if (!stations[i].assigned) continue;
+    request.redEStop = request.redEStop || stations[i].eStopped;
+    request.greenAStop = request.greenAStop || stations[i].aStopped;
+  }
+  return request;
+}
 }  // namespace field_light

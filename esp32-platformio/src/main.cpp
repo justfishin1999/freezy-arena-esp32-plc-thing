@@ -1,5 +1,7 @@
-// Freezy Arena standalone dual-relay ESP32 gateway.
-// GPIO26: robot fault relay; GPIO27: FMS status relay.
+// Freezy Arena standalone E-stop / A-stop light controller.
+// GPIO26: RED relay energized if ANY assigned team E-stopped.
+// GPIO27: GREEN relay energized if ANY assigned team A-stopped.
+// The two independent HIGH-trigger relays can both energize simultaneously.
 // Tested single-channel 5V relay modules set to HIGH trigger. The GPIO
 // signals only drive relay IN; relay coils get separate 5V/GND power.
 // Subscribe to Freezy Arena's existing Field Monitor WebSocket, no server patch. 
@@ -20,7 +22,7 @@
 #include "WebUI.h"
 
 namespace {
-constexpr const char *kVersion = "2026.10.21.relay1.0";
+constexpr const char *kVersion = "2026.10.22.stops1.0";
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kArenaPortDefault = 8080;
 constexpr uint32_t kServerSilenceMs = 30000;
@@ -31,7 +33,6 @@ constexpr size_t kMaxWsMessageBytes = 64U * 1024U;
 constexpr uint32_t kNoStatusWarningMs = 8000;
 constexpr uint32_t kWifiAttemptMs = 12000;
 constexpr uint32_t kTestDurationMs = 15000;
-constexpr uint32_t kRelayFlashHalfCycleMs = 1000; // 1s ON / 1s OFF on FMS loss
 constexpr uint32_t kSessionIdleMs = 30UL * 60UL * 1000UL;
 constexpr uint32_t kButtonHoldMs = 10000;
 constexpr uint32_t kApAfterWifiLostMs = 15000;
@@ -91,17 +92,15 @@ bool wsStarted = false;
 bool wsConnected = false;
 bool haveState = false;
 bool haveArenaStatus = false;
-bool robotsReady = false;
-bool canStartMatch = false;
-uint8_t robotsAssigned = 0;
-uint8_t robotsSatisfied = 0;
+uint8_t eStopMask = 0;  // Bits R1, R2, R3, B1, B2, B3
+uint8_t aStopMask = 0;
+uint8_t teamsAssigned = 0;
 uint32_t lastArenaStatusMs = 0;
-bool redOn = false;  // predicted PLC lamp request, NOT relay feedback
-bool greenOn = false;
-bool plcLinkEnabled = false;
-bool heartbeatLevelHigh = false;
-bool runningLevelHigh = false;
-uint32_t lastHeartbeatToggleMs = 0;
+bool redOn = false;    // Commanded relay GPIO level, not contact feedback
+bool greenOn = false;  // HIGH means energized on verified H-trigger modules
+bool lastStatusFresh = false;
+bool lastStopRed = false;
+bool lastStopGreen = false;
 int fieldState = -1;
 uint32_t lastFrameMs = 0;
 uint32_t lastWifiAttempt = 0;
@@ -114,12 +113,7 @@ uint32_t buttonDownSince = 0;
 bool resetButtonActivated = false;
 
 bool manualActive = false;
-bool manualBlink = false;
-bool relay2Blinking = false;
-bool lastBlinkMode = false;
-bool lastRobotFault = false;
-bool lastFmsConnected = false;
-field_light::PlcSignalRequest manualCommand{false, false};
+field_light::StopRelayRequest manualCommand{false, false};
 uint32_t manualUntilMs = 0;
 uint32_t rebootAtMs = 0;
 bool otaStarted = false;
@@ -235,26 +229,20 @@ void resetCredentials() {
   rebootAtMs = millis() + 600;
 }
 
-// Set relay control GPIOs LOW before configuring output. H trigger = HIGH ON.
+// H jumper: GPIO HIGH energizes relay, LOW releases it. CMD is NOT ground.
 void initializeRelayPins() {
   digitalWrite(config.heartbeatPin, LOW);
   digitalWrite(config.runningPin, LOW);
   pinMode(config.heartbeatPin, OUTPUT);
   pinMode(config.runningPin, OUTPUT);
-  heartbeatLevelHigh = false;
-  runningLevelHigh = false;
-  plcLinkEnabled = false;
   redOn = false;
   greenOn = false;
 }
-void setRelays(bool robotFault, bool fmsHealth) {
-  // Both independent relays are allowed to energize simultaneously.
-  if (redOn != robotFault) digitalWrite(config.heartbeatPin, robotFault ? HIGH : LOW);
-  if (greenOn != fmsHealth) digitalWrite(config.runningPin, fmsHealth ? HIGH : LOW);
-  redOn = robotFault;
-  greenOn = fmsHealth;
-  heartbeatLevelHigh = robotFault;
-  runningLevelHigh = fmsHealth;
+void setRelays(bool redEStop, bool greenAStop) {
+  if (redOn != redEStop) digitalWrite(config.heartbeatPin, redEStop ? HIGH : LOW);
+  if (greenOn != greenAStop) digitalWrite(config.runningPin, greenAStop ? HIGH : LOW);
+  redOn = redEStop;
+  greenOn = greenAStop;
 }
 
 bool freshField() {
@@ -280,10 +268,9 @@ bool freshArenaStatus() {
 
 void clearArenaStatus() {
   haveArenaStatus = false;
-  robotsReady = false;
-  canStartMatch = false;
-  robotsAssigned = 0;
-  robotsSatisfied = 0;
+  eStopMask = 0;
+  aStopMask = 0;
+  teamsAssigned = 0;
   lastArenaStatusMs = 0;
 }
 
@@ -295,30 +282,31 @@ void stopManualTest(const String &reason) {
 }
 
 void updateOutputs() {
-  if (otaStarted || rebootAtMs) { setRelays(false, false); return; }
-  if (manualActive && static_cast<int32_t>(millis() - manualUntilMs) >= 0)
-    stopManualTest("Relay test expired; automatic control restored");
-  if (manualActive && fieldPhase() == field_light::FieldPhase::Running)
-    stopManualTest("Relay test cancelled: match started");
-
-  const bool fmsLive = freshArenaStatus();
-  const field_light::DualRelayRequest plan = manualActive
-      ? field_light::DualRelayRequest{manualCommand.heartbeatEnabled,
-                                     manualCommand.runningHigh, manualBlink}
-      : field_light::dualRelayRequest(fmsLive, robotsReady);
-  const bool output2 = field_light::healthRelayOutput(
-      plan, millis(), kRelayFlashHalfCycleMs);
-  if (plan.robotFault != lastRobotFault || plan.fmsConnected != lastFmsConnected ||
-      plan.flashFmsRelay != lastBlinkMode) {
-    addLog(String("Relays: R1 fault ") + (plan.robotFault ? "ON" : "OFF") +
-           ", R2 FMS " + (plan.flashFmsRelay ? "FLASH" : plan.fmsConnected ? "ON" : "OFF"));
-    lastRobotFault = plan.robotFault;
-    lastFmsConnected = plan.fmsConnected;
-    lastBlinkMode = plan.flashFmsRelay;
+  if (otaStarted || rebootAtMs) {
+    setRelays(false, false);
+    return;
   }
-  relay2Blinking = plan.flashFmsRelay;
-  plcLinkEnabled = fmsLive;
-  setRelays(plan.robotFault, output2);
+  if (manualActive && static_cast<int32_t>(millis() - manualUntilMs) >= 0)
+    stopManualTest("Stop-light test expired; automatic status restored");
+  if (manualActive && fieldPhase() == field_light::FieldPhase::Running)
+    stopManualTest("Stop-light test cancelled: match started");
+
+  const bool statusFresh = freshArenaStatus();
+  // Invalid or stale FMS data is UNKNOWN, not an asserted team stop.
+  const field_light::StopRelayRequest requested = manualActive
+      ? manualCommand
+      : field_light::StopRelayRequest{statusFresh && eStopMask != 0,
+                                      statusFresh && aStopMask != 0};
+  if (requested.redEStop != lastStopRed || requested.greenAStop != lastStopGreen ||
+      statusFresh != lastStatusFresh) {
+    addLog(String("Stops: ") + (statusFresh ? "FMS ONLINE" : "FMS UNKNOWN") +
+           ", RED E-stop " + (requested.redEStop ? "ON" : "OFF") +
+           ", GREEN A-stop " + (requested.greenAStop ? "ON" : "OFF"));
+    lastStopRed = requested.redEStop;
+    lastStopGreen = requested.greenAStop;
+    lastStatusFresh = statusFresh;
+  }
+  setRelays(requested.redEStop, requested.greenAStop);
 }
 
 // Decode a complete logical text message. A single JSON document may arrive
@@ -333,12 +321,10 @@ void processArenaText(const uint8_t *payload, size_t length) {
   if (!filterInitialized) {
     filter["type"] = true;
     filter["data"]["MatchState"] = true;
-    filter["data"]["CanStartMatch"] = true;
     for (const char *station : kStations) {
       filter["data"]["AllianceStations"][station]["Team"]["Id"] = true;
-      filter["data"]["AllianceStations"][station]["Bypass"] = true;
-      filter["data"]["AllianceStations"][station]["DsConn"]["RobotLinked"] = true;
       filter["data"]["AllianceStations"][station]["EStop"] = true;
+      filter["data"]["AllianceStations"][station]["AStop"] = true;
     }
     filterInitialized = true;
   }
@@ -386,44 +372,54 @@ void processArenaText(const uint8_t *payload, size_t length) {
     // This message comes from the existing field-monitor WebSocket, which
     // does NOT require match-play administration privileges.
     const JsonVariantConst status = message["data"];
-    if (!status["CanStartMatch"].is<bool>() || !status["AllianceStations"].is<JsonObjectConst>()) {
+    if (!status["AllianceStations"].is<JsonObjectConst>()) {
       clearArenaStatus();
-      addLog("Arena status missing readiness data");
+      addLog("Arena status missing AllianceStations; no stop inferred");
       return;
     }
+    field_light::StationStopState stations[6]{};
     uint8_t assigned = 0;
-    uint8_t satisfied = 0;
-    bool stationsValid = true;
-    for (const char *station : kStations) {
-      const JsonVariantConst info = status["AllianceStations"][station];
-      if (info.isNull() || !info["Bypass"].is<bool>() || !info["EStop"].is<bool>()) {
-        stationsValid = false;
+    uint8_t redMask = 0;
+    uint8_t greenMask = 0;
+    bool valid = true;
+    for (size_t i = 0; i < 6; ++i) {
+      const JsonVariantConst info = status["AllianceStations"][kStations[i]];
+      // Explicit boolean stop values are required; never infer stops from
+      // disconnected/unassigned driver stations or missing JSON fields.
+      if (info.isNull() || !info["EStop"].is<bool>() || !info["AStop"].is<bool>()) {
+        valid = false;
         break;
       }
-      // No team assigned = no robot required (useful for filler matches).
-      if ((info["Team"]["Id"] | 0) <= 0) continue;
-      ++assigned;
-      const bool bypassed = info["Bypass"].as<bool>();
-      const bool linked = info["DsConn"]["RobotLinked"] | false;
-      if ((bypassed || linked) && !info["EStop"].as<bool>()) ++satisfied;
+      stations[i].assigned = (info["Team"]["Id"] | 0) > 0;
+      stations[i].eStopped = info["EStop"].as<bool>();
+      stations[i].aStopped = info["AStop"].as<bool>();
+      if (stations[i].assigned) {
+        ++assigned;
+        if (stations[i].eStopped) redMask |= uint8_t(1U << i);
+        if (stations[i].aStopped) greenMask |= uint8_t(1U << i);
+      }
     }
-    if (!stationsValid) {
+    if (!valid) {
       clearArenaStatus();
-      addLog("Arena station data incomplete");
+      addLog("Arena station data missing EStop or AStop; no stop inferred");
       return;
     }
-    const bool wasReady = robotsReady;
-    const bool wasStartable = canStartMatch;
-    robotsAssigned = assigned;
-    robotsSatisfied = satisfied;
-    robotsReady = (assigned > 0 && assigned == satisfied);
-    canStartMatch = status["CanStartMatch"].as<bool>();
+    const auto stopReq = field_light::stopRelaysForStations(true, stations, 6);
+    const bool changed = !haveArenaStatus || redMask != eStopMask ||
+                         greenMask != aStopMask;
+    eStopMask = redMask;
+    aStopMask = greenMask;
+    teamsAssigned = assigned;
     haveArenaStatus = true;
     lastArenaStatusMs = millis();
     lastFrameMs = millis();
-    if (wasReady != robotsReady || wasStartable != canStartMatch)
-      addLog(String("Arena ready: robots ") + String(satisfied) + "/" + String(assigned) +
-             (canStartMatch ? ", start permitted" : ", start blocked"));
+    if (changed) {
+      addLog(String("Arena team stops: RED ") +
+             (stopReq.redEStop ? "ACTIVE" : "clear") +
+             ", GREEN " + (stopReq.greenAStop ? "ACTIVE" : "clear") +
+             " (assigned teams " + String(assigned) + ")");
+    }
+
   } else if (strcmp(kind, "ping") == 0 || strcmp(kind, "matchLoad") == 0 ||
              strcmp(kind, "matchTiming") == 0) {
     lastFrameMs = millis();
@@ -772,12 +768,17 @@ void statusHandler() {
   doc["fragmentErrors"] = wsFragmentErrorCount;
   doc["arenaWsPath"] = wsPath;
   doc["frameAgeSec"] = wsConnected ? static_cast<int>((millis() - lastFrameMs) / 1000) : -1;
-  doc["monitorModeName"] = "Dual-relay fault + FMS";
+  doc["monitorModeName"] = "Any team E-stop / A-stop";
   doc["arenaStatusFresh"] = freshArenaStatus();
-  doc["robotReady"] = freshArenaStatus() && robotsReady;
-  doc["robotsAssigned"] = freshArenaStatus() ? robotsAssigned : 0;
-  doc["robotsSatisfied"] = freshArenaStatus() ? robotsSatisfied : 0;
-  doc["canStartMatch"] = freshArenaStatus() && canStartMatch;
+  doc["teamsAssigned"] = freshArenaStatus() ? teamsAssigned : 0;
+  JsonArray eStopped = doc["eStoppedStations"].to<JsonArray>();
+  JsonArray aStopped = doc["aStoppedStations"].to<JsonArray>();
+  if (freshArenaStatus()) {
+    for (size_t i = 0; i < 6; ++i) {
+      if (eStopMask & (1U << i)) eStopped.add(kStations[i]);
+      if (aStopMask & (1U << i)) aStopped.add(kStations[i]);
+    }
+  }
   doc["matchState"] = freshField() ? fieldState : -1;
   doc["matchName"] = freshField() ? fieldStateName(fieldState) : "Unknown";
   const auto phase = fieldPhase();
@@ -787,12 +788,8 @@ void statusHandler() {
   doc["manualRemaining"] = manualActive ? (static_cast<uint32_t>(manualUntilMs - millis()) / 1000) : 0;
   doc["red"] = redOn;
   doc["green"] = greenOn;
-  doc["relay2Blinking"] = relay2Blinking;
   doc["relay1On"] = redOn;
   doc["relay2On"] = greenOn;
-  doc["plcLinkEnabled"] = plcLinkEnabled;
-  doc["heartbeatLevelHigh"] = heartbeatLevelHigh;
-  doc["runningLevelHigh"] = runningLevelHigh;
   doc["heartbeatPin"] = config.heartbeatPin;
   doc["runningPin"] = config.runningPin;
   sendJson(200, doc);
@@ -860,16 +857,14 @@ void manualTestHandler() {
     sendMessage(200, "Automatic control restored");
     return;
   }
-  if (mode != "red" && mode != "green" && mode != "both" &&
-      mode != "outage" && mode != "off") {
-    sendMessage(400, "Choose red, green, both, outage, off, or auto"); return;
+  if (mode != "red" && mode != "green" && mode != "both" && mode != "off") {
+    sendMessage(400, "Choose red, green, both, off, or auto"); return;
   }
   if (fieldPhase() == field_light::FieldPhase::Running) {
     sendMessage(409, "Testing disabled while an actual match runs"); return;
   }
-  manualCommand = {mode == "red" || mode == "both" || mode == "outage",
+  manualCommand = {mode == "red" || mode == "both",
                    mode == "green" || mode == "both"};
-  manualBlink = (mode == "outage");
   manualActive = true;
   manualUntilMs = millis() + kTestDurationMs;
   updateOutputs();
@@ -1021,7 +1016,7 @@ void setup() {
   initializeRelayPins();
   pinMode(kButtonPin, INPUT_PULLUP);
   ensureCredentials();
-  addLog("Boot: 2 relay GPIOs LOW; R1=robot fault, R2=FMS healthy");
+  addLog("Boot: 2 relays LOW; RED GPIO26=any team E-stop, GREEN GPIO27=any team A-stop");
   WiFi.persistent(false);
   WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);

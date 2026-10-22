@@ -1,61 +1,58 @@
-# Freezy Arena · ESP32 Direct Dual Relay
+# Freezy Arena ESP32 — E-stop / A-stop Indicator
 
-**This is the `direct-dual-relay-field-monitor` branch.** The Horner PLC version
-remains intact on `main`. The standalone ESP32 monitors an **unmodified** Freezy Arena server.
+**Branch:** `estop-astop-dual-relay` (based on the standalone direct dual-relay
+firmware, not the PLC firmware). The previous `direct-dual-relay-field-monitor`
+and PLC `main` branches are untouched.
 
-## Relay behavior
+The ESP32 subscribes read-only to stock Freezy Arena's existing
+`/displays/field_monitor/websocket` and reads the published `EStop` and
+`AStop` flags for all six alliance stations.
 
-| Condition | Relay 1 (GPIO26) — Robot fault | Relay 2 (GPIO27) — FMS health |
+| Live FMS condition | Relay 1 / GPIO26 / RED | Relay 2 / GPIO27 / GREEN |
 | --- | --- | --- |
-| FMS connected; every assigned robot linked or station bypassed | OFF | ON |
-| FMS connected; a required robot disconnects mid-match (or E-stop) | ON | ON |
-| FMS disconnected or `arenaStatus` older than 4 seconds | ON | FLASH: 1 s ON / 1 s OFF |
+| No team E-stopped or A-stopped | OFF | OFF |
+| Any assigned team E-stopped | ON | OFF |
+| Any assigned team A-stopped | OFF | ON |
+| Both types active, on same or different teams | ON | ON |
+| FMS status unavailable or older than 4 s | OFF | OFF (status UNKNOWN) |
 
-These are **independent** outputs: both may be ON simultaneously. Neither
-depends on whether a match is actually running. Freezy Arena publishes robot
-`RobotLinked`, `Bypass`, `EStop`, and assigned team information through its
-existing `/displays/field_monitor/websocket` endpoint, which our ESP32 subscribes
-to in read-only mode. No server modifications are needed.
+**"Any team" means any currently assigned team (R1–R3, B1–B3).** Empty
+stations are ignored. Normal robot disconnections or bypasses no longer
+trigger the outputs. E-stop and A-stop status comes from the FMS; their
+latching/reset behavior belongs to Freezy Arena and is not reproduced by the
+ESP32. No match-running requirement: the relays reflect the published stops
+whenever status is fresh.
 
-Unassigned stations are ignored. A bypassed assigned station counts as ready
-unless E-stopped. With zero assigned teams the indicator conservatively reports
-a robot-not-ready fault.
+**Unknown FMS status cannot safely be represented as "no stops".** The dashboard
+explicitly displays UNKNOWN and suppresses both relay outputs. This accessory
+is NOT a safety interlock, emergency-stop system, protective device or
+replacement for the actual FMS/field stop hardware. If the ESP32 loses power
+its relay outputs also turn OFF.
 
-## Hardware setup
+## Wiring (same as existing direct-relay project)
 
-Use **two 5 V, high-level-trigger relay modules**, with **H** selected on both
-modules' jumpers:
+- 5 V to both relay-module `DC+` terminals.
+- Actual ESP32 `GND` to both module `DC−` terminals. **Do not use CMD.**
+- ESP32 `GPIO26 / P26` to **RED relay (R1) IN**.
+- ESP32 `GPIO27 / P27` to **GREEN relay (R2) IN**.
+- Set both modules' H/L trigger jumpers to **H** (HIGH to energize).
+- Lamp's separate 12 V circuits connect through each relay's COM/NO contacts.
 
-| ESP32/power | Relay board terminal | Role |
-| --- | --- | --- |
-| GPIO26 / P26 | Relay 1 `IN` | Robot fault |
-| GPIO27 / P27 | Relay 2 `IN` | FMS health |
-| Regulated 5 V | Both `DC+` | Relay coil power |
-| Real ESP32 GND | Both `DC−` | Shared low-voltage reference |
+The ESP32 GPIO only sends a 3.3 V logic signal; it does not power relay coils.
 
-Use the isolated `COM` and `NO` contacts on each relay to switch your
-12 V stack light circuits. The GPIO output is 3.3 V and controls the relay
-input only; it does **not** provide coil power. The two modules used during
-prototyping worked reliably in HIGH-trigger mode. Do **not** use the ESP32
-flash-memory `CMD` pin as ground.
+## Build and verify
 
-## Build and test
+1. Open `esp32-platformio/` in VS Code with PlatformIO.
+2. Select `esp32dev`, build and upload, or use the ESP32 OTA web dashboard
+   with the built `.pio/build/esp32dev/firmware.bin`.
+3. Stored Wi-Fi credentials, server address, management login and configurable
+   GPIOs persist from the previous direct-relay build.
+4. The dashboard labels both stop indicators and lists the stopped station IDs.
+   Manual tests: **RED E-stop**, **GREEN A-stop**, **Both ON**, **Both OFF**,
+   **Return AUTO**, with 15-second timeout and disabled during active matches.
+5. Check each stop using normal authorized FMS test procedures, and separately
+   confirm missing FMS status changes the dashboard to UNKNOWN with both
+   automatic relay outputs OFF.
 
-1. Open the `esp32-platformio/` folder in VS Code/PlatformIO.
-2. Run **Clean → Build → Upload** for `esp32dev`, or upload the compiled
-   `.pio/build/esp32dev/firmware.bin` through the ESP32 dashboard.
-3. Configure Wi-Fi and Freezy Arena IP/port in the dashboard.
-4. Use the tests **Relay 1**, **Relay 2**, **Both ON**, **FMS outage pattern**,
-   **Both OFF**, and **Return AUTO**. Tests last no more than 15 seconds and
-   are disabled during a running FMS match.
-5. Verify `arenaStatus` counter advances under Diagnostics, and test a
-   disconnected robot plus unplugging FMS network access.
-
-Existing Wi-Fi credentials and management login remain in ESP32 NVS. Pin
-preferences stay configurable (defaults GPIO26/27). This is a status accessory,
-**not a safety-rated device**. During ESP32 power loss or reset, the controller
-cannot energize or blink relays. Frequent mechanical-relay blinking shortens
-contact/coil life; for long outages consider the tower's own LED flasher or an
-appropriately rated solid-state output instead.
-
-No changes have been made to the original `Freezy-Arena/freezy-arena` FMS repository.
+The PLC project, Freezy Arena server, and previous direct-relay branch are
+not modified.
